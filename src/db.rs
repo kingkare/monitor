@@ -10,7 +10,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A string an agent reported, cut down to what may be shown. Control
 /// characters break the panel's rows, and the characters markup is made of are
@@ -1062,12 +1062,7 @@ impl Db {
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO setting (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+        put_setting(&self.conn(), key, value)
     }
 
     // ---- nodes ----
@@ -1095,13 +1090,14 @@ impl Db {
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let id = next_id(&tx, "node")?;
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
+            "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -1115,10 +1111,10 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 Utc::now().timestamp(),
-                n.group
+                n.group,
+                id
             ],
         )?;
-        let id = tx.last_insert_rowid();
         // Only a registration without `--name` arrives unnamed; the panel
         // requires a name.
         if n.name.is_empty() {
@@ -1259,9 +1255,7 @@ impl Db {
         let conn = self.conn();
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared explicitly; the other history
-        // tables cascade. SQLite reassigns a deleted node's id to the next node
-        // created, which would otherwise inherit the removed machine's latency
-        // chart.
+        // tables cascade.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
@@ -2004,12 +1998,13 @@ impl Db {
             t.id
         } else {
             // At the end, as in `create_node`.
+            let id = next_id(&tx, "ping_task")?;
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval, auto_join, sort)
-                 VALUES (?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
-                params![t.name, t.target, t.interval, t.auto_join],
+                "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)
+                 VALUES (?5,?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
+                params![t.name, t.target, t.interval, t.auto_join, id],
             )?;
-            tx.last_insert_rowid()
+            id
         };
         let added: Vec<i64> = match &t.base {
             Some(base) if t.id > 0 => {
@@ -2112,11 +2107,7 @@ impl Db {
     /// Deletes a probe and the results filed under it.
     ///
     /// `ping_record` carries no foreign key, so it is cleared explicitly, as in
-    /// `delete_node`; `ping_hour` cascades. SQLite reassigns a deleted probe's
-    /// id to the next one created, and the chart selects on `task_id IN
-    /// (assignments for this node)`: without this the new probe would draw the
-    /// removed one's latency under its own name, with its timeouts folded into
-    /// the loss figure.
+    /// `delete_node`; `ping_hour` cascades.
     ///
     /// Each delete is a scan -- the keys begin at `node_id` -- bounded by the
     /// week of minute rows and the hourly tier, for an action taken manually a
@@ -2188,12 +2179,12 @@ impl Db {
     /// being WITHOUT ROWID and keyed for the chart query. Two cases arrive
     /// without an assignment. A result already in flight when the panel deleted
     /// its probe, which would otherwise land after `delete_ping_task` swept the
-    /// history and be inherited by whichever probe SQLite assigns the id to next.
+    /// history and stay behind under an id no probe holds.
     /// And a node token in the wrong hands: `task_id` is chosen by the reporter,
     /// so without the test the rows it could create would be unbounded.
     ///
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
-    /// does not prevent the write, its storage, or the id being reused.
+    /// does not prevent the write or its storage.
     pub fn insert_pings(&self, node_id: i64, results: &[(i64, i64, i64)]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -2541,12 +2532,26 @@ impl Db {
     /// half a database behind.
     ///
     /// Call [`Db::check_backup`] first, as it is what brings `src` to this
-    /// build's schema; the copy is then the last step and nothing after it can
-    /// fail. Like the other two, this reads and writes the whole file and belongs
-    /// off the runtime.
+    /// build's schema; the copy is then the last step that can fail. Like the
+    /// other two, this reads and writes the whole file and belongs off the
+    /// runtime.
+    ///
+    /// The live file's id high marks outlast the copy: an id issued after the
+    /// backup was taken may still key the hub's memory -- the offline sweep, the
+    /// country lookup -- and an older mark would issue it again.
     pub fn restore_from(&self, src: &str) -> Result<()> {
         let mut conn = self.conn();
+        let live = ID_TABLES.map(|table| issued(&conn, table));
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
+        for (table, live) in ID_TABLES.into_iter().zip(live) {
+            let kept = live.and_then(|live| {
+                let id = issued(&conn, table)?.max(live);
+                put_setting(&conn, &format!("{table}_id_issued"), &id.to_string())
+            });
+            if let Err(e) = kept {
+                warn!("keeping the {table} id high mark across the restore failed: {e:#}");
+            }
+        }
         Ok(())
     }
 
@@ -2649,6 +2654,42 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Tally)>, 
         }
         out.push(row);
     }
+}
+
+/// The id for a new row of `table`: one past every id it has issued, deleted
+/// rows included. SQLite's default reissues the highest id once its row is
+/// deleted, and state the hub keeps by id -- the offline sweep's absence and
+/// return times, an editor opened before the delete -- would pass to the new
+/// row. The high mark lives in `setting`, so a backup carries it; without one,
+/// as after an upgrade, the table's own highest id stands in.
+fn next_id(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<i64> {
+    let id = issued(tx, table)? + 1;
+    put_setting(tx, &format!("{table}_id_issued"), &id.to_string())?;
+    Ok(id)
+}
+
+/// The highest id `table` has issued, by its high mark or its rows.
+fn issued(conn: &Connection, table: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key = ?1), 0),
+                        COALESCE((SELECT MAX(id) FROM {table}), 0))"
+        ),
+        [format!("{table}_id_issued")],
+        |r| r.get(0),
+    )?)
+}
+
+/// The tables whose ids [`next_id`] issues.
+const ID_TABLES: [&str; 2] = ["node", "ping_task"];
+
+fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
@@ -2913,10 +2954,10 @@ mod tests {
             db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
         db.backup_into(&copy).unwrap();
 
-        // Everything after the copy must disappear on restore, including a node
-        // that reclaimed the deleted one's id.
+        // Everything after the copy must disappear on restore.
         db.delete_node(kept).unwrap();
-        db.create_node(&Node { name: "after".into(), ..Default::default() }, "token-after").unwrap();
+        let after =
+            db.create_node(&Node { name: "after".into(), ..Default::default() }, "token-after").unwrap();
 
         db.check_backup(&copy).unwrap();
         db.restore_from(&copy).unwrap();
@@ -2927,8 +2968,9 @@ mod tests {
 
         // The connection remains the hub's: it can write, it is on the schema this
         // build expects, and it retains the journal mode the hub opened with --
-        // the copy `VACUUM INTO` wrote is not in WAL mode.
-        node(&db, 1);
+        // the copy `VACUUM INTO` wrote is not in WAL mode. Nor does it issue
+        // again an id the live file had issued.
+        assert!(node(&db, 1) > after, "an id issued before the restore is not issued again");
         let conn = db.conn();
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
@@ -3400,6 +3442,11 @@ mod tests {
         db.insert_pings(id, &[(task, 1, 42)]).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
+        let pings = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ping_record WHERE node_id = ?1", [id], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(pings, 0, "ping_record has no foreign key to cascade through");
         assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
         // Ticked in an editor opened before the delete: named, not a 500.
@@ -3411,22 +3458,10 @@ mod tests {
             "{gone:#}"
         );
 
-        // `ping_record` has no foreign key to cascade through, and SQLite reassigns
-        // the deleted id to the next node created: without the sweep in
-        // `delete_node` the new machine would draw the old one's chart.
-        let fresh = node(&db, 1);
-        assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
-        db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
-        assert!(
-            db.ping_records(fresh, Span::minutes(0, 60)).unwrap().0.is_empty(),
-            "and it starts with no history"
-        );
+        assert_ne!(node(&db, 1), id, "a deleted node's id is not issued again");
     }
 
-    /// The mirror of the sweep above, on the other key of the same table. SQLite
-    /// reuses a deleted probe's id as well, and the chart selects on a node's
-    /// assignments, so the removed probe's samples would reappear under the new
-    /// probe's name with its timeouts folded into the new loss figure.
+    /// The mirror of the sweep above, on the other key of the same table.
     #[test]
     fn deleting_a_probe_takes_its_history_with_it() {
         let db = db();
@@ -3442,18 +3477,19 @@ mod tests {
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
         db.insert_pings(id, &[(old, 1, 999)]).unwrap();
         db.delete_ping_task(old).unwrap();
+        let pings = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ping_record WHERE task_id = ?1", [old], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(pings, 0, "ping_record has no foreign key to cascade through");
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
-        assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
-        assert!(
-            db.ping_records(id, Span::minutes(0, 60)).unwrap().0.is_empty(),
-            "and it starts with no history"
-        );
+        assert_ne!(fresh, old, "a deleted probe's id is not issued again");
     }
 
     /// An earlier build deleting a node or a probe runs only its own statements,
     /// those of v1.3.1 below, and knows nothing of `ping_hour`. Rows it leaves
-    /// would be drawn under the next node or probe given the id, once the newer
+    /// would stay behind under an id no node or probe holds, once the newer
     /// build is back.
     #[test]
     fn an_earlier_builds_deletes_clear_the_hourly_probe_rows() {
@@ -3540,8 +3576,7 @@ mod tests {
         assert_eq!(rows().unwrap(), 1, "nothing else reaches the table");
 
         // Deleting the probe also ends its node's results, so one already in flight
-        // cannot land after the sweep and be inherited by the next probe to take
-        // the id.
+        // cannot land after the sweep and stay behind under an id no probe holds.
         db.delete_ping_task(task).unwrap();
         db.insert_pings(mine, &[(task, 2, 42)]).unwrap();
         assert_eq!(rows().unwrap(), 0, "a late result for a deleted probe is dropped");
